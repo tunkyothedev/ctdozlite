@@ -6221,20 +6221,32 @@ pub fn extract_mute_controls(data_node: &Value, now_unix: i64) -> Vec<MuteContro
 }
 
 /// Request mobile message sync (`pullMobileMsg` @ `app.asar`, cmd `12000`, `file` endpoint, #68, #73).
-/// Sends a wake-up/sync signal to the user's phone Zalo client to push recent messages.
-pub async fn request_phone_sync(s: &Session, public_key: &str) -> Result<Value> {
+///
+/// One page of the phone's message backup. The official client pages sequentially by
+/// `from_seq_id` (`t ? t+=1 : t=0`, see re-notes/09) and passes the `temp_key` that arrived
+/// with the `transfer_after_login` control event; an unregistered key answers
+/// `error_code 114 "Tham số không hợp lệ"`.
+///
+/// # Errors
+/// Transport failures propagate; server business errors are returned in the envelope.
+pub async fn pull_mobile_page(
+    s: &Session,
+    public_key: &str,
+    from_seq_id: i64,
+    temp_key: &str,
+) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
     let body = json!({
         "pc_name": s.computer_name,
         "public_key": public_key,
-        "from_seq_id": 0,
+        "from_seq_id": from_seq_id,
         "is_retry": 0,
         "min_seq_id": 0,
         "last_action_id": 0,
         "last_group_action_id": 0,
-        "temp_key": "",
+        "temp_key": temp_key,
         "imei": s.imei
     });
     let params = s.encoded_params(&body)?;
@@ -6247,6 +6259,8 @@ pub async fn request_phone_sync(s: &Session, public_key: &str) -> Result<Value> 
         if dec.get("error_code").and_then(Value::as_i64) == Some(0) {
             return Ok(dec);
         }
+        // The GET candidate path covers host failover; business errors are still final.
+        return Ok(dec);
     }
     let post_url = format!(
         "{}/api/message/pull_mobile_msg?{}",
@@ -6257,8 +6271,25 @@ pub async fn request_phone_sync(s: &Session, public_key: &str) -> Result<Value> 
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
+/// Wake-up call: pull page 0 with an empty `temp_key`, notifying the phone to prepare sync.
+///
+/// The deep-sync flow ([`pull_mobile_page`]) supersedes this for actual history pulls;
+/// kept for the existing recent-sync button where the phone only pushes to `lp_chat`.
+///
+/// # Errors
+/// Transport failures propagate; server business errors are returned in the envelope.
+pub async fn request_phone_sync(s: &Session, public_key: &str) -> Result<Value> {
+    pull_mobile_page(s, public_key, 0, "").await
+}
+
 /// Request transfer-sync v2 from phone (`requestSyncMessage` @ `app.asar`, cmd `12888`, `file` endpoint, #68, #73).
-pub async fn request_phone_sync_v2(s: &Session, public_key: &str) -> Result<Value> {
+///
+/// `temp_key` is empty until the `transfer_after_login` control event delivers one;
+/// a non-empty value tells the phone this PC already holds the transfer session.
+///
+/// # Errors
+/// Transport failures propagate; server business errors are returned in the envelope.
+pub async fn request_phone_sync_v2(s: &Session, public_key: &str, temp_key: &str) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -6269,7 +6300,7 @@ pub async fn request_phone_sync_v2(s: &Session, public_key: &str) -> Result<Valu
         "is_retry": 0,
         "last_action_id": 0,
         "last_group_action_id": 0,
-        "temp_key": "",
+        "temp_key": temp_key,
         "imei": s.imei
     });
     let params = s.encoded_params(&body)?;
@@ -6308,6 +6339,58 @@ pub async fn cancel_phone_sync(s: &Session, public_key: &str) -> Result<Value> {
     );
     let resp = s.get_endpoint("file", &path).await?;
     Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+}
+
+/// Merge one `pull_mobile_msg` page into `threads`.
+///
+/// The page shape is not yet live-verified ([U] in re-notes/09) — phone backup segments are
+/// expected to carry the same message objects `lp_chat` pushes use, so this routes through
+/// the same tolerant parser as the rest of the sync paths. Kept as a named seam so the
+/// first real capture can extend unwrapping here without touching the paging loop.
+pub fn merge_mobile_page(threads: &mut Vec<Thread>, page: &Value) {
+    merge_previews(threads, page);
+}
+
+/// True when a `pull_mobile_msg` envelope reports the phone refused / lost the transfer
+/// session (`114` invalid params = unregistered key, `-69` stop retry = exhausted/invalid
+/// cursor). The deep-sync loop treats these as terminal, not retryable.
+pub fn mobile_page_rejected(resp: &Value) -> bool {
+    matches!(
+        resp.get("error_code").and_then(Value::as_i64),
+        Some(114) | Some(-69)
+    )
+}
+
+/// Message-like entry count in a `pull_mobile_msg` page, for progress reporting.
+///
+/// Scans the same keys [`merge_previews`] consumes; a rough count is enough for the
+/// "đã tải N tin" status line, so unknown shapes simply report 0 (never an error).
+pub fn count_mobile_page_msgs(page: &Value) -> usize {
+    let data_node = page.get("data").unwrap_or(page);
+    let obj = match data_node.as_object() {
+        Some(o) => o,
+        None => return 0,
+    };
+    for key in ["msgs", "groupMsgs", "pageMsgs", "conversations", "threads", "allmsgs"] {
+        if let Some(arr) = obj.get(key).and_then(Value::as_array) {
+            let inner: usize = arr
+                .iter()
+                .map(|e| {
+                    e.get("messages")
+                        .or_else(|| e.get("msgs"))
+                        .and_then(Value::as_array)
+                        .map(|m| m.len())
+                        .unwrap_or(1)
+                })
+                .sum();
+            if inner > 0 {
+                return inner;
+            }
+        }
+    }
+    obj.iter()
+        .filter(|(_, v)| v.is_object())
+        .count()
 }
 
 /// Hide or unhide a conversation (`updateItemHiddenChat` @ `compact-app-pc.js:14384423`, cmd `10049`).

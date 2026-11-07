@@ -46,6 +46,15 @@ impl MessageStore {
             Connection::open(path)?
         };
 
+        // Standard pragmas (docs/standards/database-and-migrations.md §2): WAL keeps the GUI
+        // reader from blocking the worker writer; busy_timeout absorbs lock contention.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA foreign_keys = ON;",
+        )?;
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 msg_id TEXT PRIMARY KEY,
@@ -76,8 +85,87 @@ impl MessageStore {
                  COMMIT;",
             )?;
         }
+        // Migration 2: deep phone-sync checkpoint (#68/#19 follow-up, see re-notes/09).
+        // Single-row table (id = 1) so a cancelled deep sync resumes at the same seq page.
+        if conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? < 2 {
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS sync_checkpoints (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     from_seq_id INTEGER NOT NULL DEFAULT 0,
+                     public_key TEXT,
+                     temp_key TEXT,
+                     updated_at INTEGER
+                 );
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        }
 
         Ok(Self { conn })
+    }
+
+    /// Deep phone-sync resume point (`from_seq_id` of the next page to pull), if any.
+    pub fn deep_sync_checkpoint(&self) -> Result<Option<i64>> {
+        match self.conn.query_row(
+            "SELECT from_seq_id FROM sync_checkpoints WHERE id = 1",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(seq) => Ok(Some(seq)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Deep-sync resume page, but only if the stored checkpoint belongs to the same
+    /// transfer session (`public_key` matches). A mismatched key means the phone started
+    /// a new snapshot, so the caller restarts from seq 0.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures.
+    pub fn resume_seq_if_same_session(&self, public_key: &str) -> Result<Option<i64>> {
+        let row = self.conn.query_row(
+            "SELECT from_seq_id, public_key FROM sync_checkpoints WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        );
+        match row {
+            Ok((seq, stored_pk)) if stored_pk.as_deref() == Some(public_key) => Ok(Some(seq)),
+            Ok(_) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist the deep phone-sync resume point. Upsert on the single-row shape.
+    ///
+    /// # Errors
+    /// Propagates SQLite failures; the caller must not silently drop them (INV-4 lives in
+    /// the messages table — the checkpoint only guides paging, so a failed write here means
+    /// the next run restarts from seq 0, never data loss).
+    pub fn set_deep_sync_checkpoint(
+        &mut self,
+        from_seq_id: i64,
+        public_key: &str,
+        temp_key: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync_checkpoints (id, from_seq_id, public_key, temp_key, updated_at)
+             VALUES (1, ?1, ?2, ?3, strftime('%s','now'))
+             ON CONFLICT(id) DO UPDATE SET
+                from_seq_id = excluded.from_seq_id,
+                public_key = excluded.public_key,
+                temp_key = excluded.temp_key,
+                updated_at = excluded.updated_at",
+            params![from_seq_id, public_key, temp_key],
+        )?;
+        Ok(())
     }
 
     /// Insert a message. Returns `true` if a new row was inserted, `false` if already existed.
@@ -928,6 +1016,41 @@ mod tests {
         store.upsert_thread(&st(300)).unwrap();
         store.upsert_thread(&st(100)).unwrap();
         assert_eq!(store.all_threads().unwrap()[0].last_ts, 300);
+    }
+
+    #[test]
+    fn deep_sync_checkpoint_roundtrips_and_upserts_single_row() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        assert_eq!(store.deep_sync_checkpoint().unwrap(), None);
+        store.set_deep_sync_checkpoint(0, "pk-1", "tk-1").unwrap();
+        assert_eq!(store.deep_sync_checkpoint().unwrap(), Some(0));
+        // (INV-4 style idempotent upsert: a second write updates in place, no second row.)
+        store.set_deep_sync_checkpoint(7, "pk-2", "tk-2").unwrap();
+        assert_eq!(store.deep_sync_checkpoint().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn migration_runs_forward_only_and_is_idempotent() {
+        // Fresh DBs start at the current schema version; reopening the same file must not
+        // re-run migrations nor lose the checkpoint row.
+        let dir = std::env::temp_dir().join(format!("zalo_store_mig_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("mig.sqlite");
+        let db_str = db_path.to_str().unwrap();
+        {
+            let mut store = MessageStore::open(db_str).unwrap();
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            store.set_deep_sync_checkpoint(3, "pk", "tk").unwrap();
+        }
+        let reopened = MessageStore::open(db_str).unwrap();
+        assert_eq!(reopened.deep_sync_checkpoint().unwrap(), Some(3));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

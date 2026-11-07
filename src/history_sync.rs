@@ -32,6 +32,243 @@ pub static PHONE_SYNC_CANCEL: AtomicBool = AtomicBool::new(false);
 /// True while a phone message sync (`sync_phone_messages`) is active (#68).
 pub static PHONE_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Set by the GUI's "Dừng" button of the deep-sync card.
+pub static DEEP_SYNC_CANCEL: AtomicBool = AtomicBool::new(false);
+/// True while the deep phone sync (`sync_deep_from_phone`) is active.
+pub static DEEP_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Transfer session delivered by the phone via the `transfer_after_login` control event
+/// (`{act, data:{temp_key, imei, pc_name, public_key}}`, re-notes/09 §2). The phone/server
+/// issues these — a locally generated key answers `114` ([P] in re-notes/09).
+#[derive(Debug, Clone)]
+pub struct TransferKeys {
+    pub public_key: String,
+    pub temp_key: String,
+}
+
+/// Latest transfer keys observed by the worker's socket loop, for the deep sync to consume.
+pub static TRANSFER_KEYS: std::sync::Mutex<Option<TransferKeys>> = std::sync::Mutex::new(None);
+
+/// Extract transfer-related control acts from a socket payload node.
+///
+/// Mirrors `extract_mute_controls`: control events ride `data.controls[]` entries with an
+/// `act` field. Returns the keys for `transfer_after_login` (imei must match ours, like
+/// the official `isTransferAfterLoginControlEvent` predicate); logs the other acts.
+pub fn extract_transfer_act(
+    data_node: &serde_json::Value,
+    expected_imei: &str,
+) -> Option<TransferKeys> {
+    let acts: Vec<(String, &serde_json::Value)> = match data_node.get("controls").and_then(|c| c.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .map(|c| {
+                (
+                    c.get("act").and_then(|a| a.as_str()).unwrap_or("").to_string(),
+                    c,
+                )
+            })
+            .collect(),
+        None => data_node
+            .get("act")
+            .and_then(|a| a.as_str())
+            .map(|top| vec![(top.to_string(), data_node)])?,
+    };
+    for (act, node) in acts {
+        let data = node.get("data").unwrap_or(node);
+        match act.as_str() {
+            "transfer_after_login" => {
+                let temp_key = data.get("temp_key").and_then(|t| t.as_str()).unwrap_or("");
+                let public_key = data
+                    .get("public_key")
+                    .or_else(|| data.get("publicKey"))
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("");
+                let event_imei = data.get("imei").and_then(|i| i.as_str()).unwrap_or("");
+                if temp_key.is_empty() || public_key.is_empty() {
+                    continue;
+                }
+                if !event_imei.is_empty() && event_imei != expected_imei {
+                    continue;
+                }
+                return Some(TransferKeys {
+                    public_key: public_key.to_string(),
+                    temp_key: temp_key.to_string(),
+                });
+            }
+            "user_confirm" | "syncmsg_info" | "transfer_error" => {
+                crate::logger::log_error(
+                    "history_sync::transfer_act",
+                    &format!("{act} event received"),
+                );
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Pull the phone's full message backup page-by-page into `zalo_history.db`
+/// (deep history for 1-1 AND groups; the official PC client's own fill path, re-notes/09).
+///
+/// Flow: wake the phone (cmd 12888) with the delivered transfer keys, retry page 0 until
+/// the phone confirms (or timeout), then page `from_seq_id = 0,1,2…` committing each page
+/// to SQLite so a cancel or crash resumes from the checkpoint, never from scratch. Never
+/// calls `delete_snapshot_mobile_msg` (cmd 12003) — that destroys the server copy.
+///
+/// Returns `(added_messages, last_seq_id)`.
+///
+/// # Errors
+/// Only transport/setup failures bail; per-page business errors end the loop and are
+/// reported through the final progress status (Vietnamese).
+pub async fn sync_deep_from_phone<F>(
+    s: &Session,
+    threads: &mut Vec<Thread>,
+    keys: Option<TransferKeys>,
+    mut on_progress: F,
+) -> Result<(usize, i64)>
+where
+    F: FnMut(f32, String),
+{
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let delivered = keys.or_else(|| TRANSFER_KEYS.lock().ok().and_then(|g| g.clone()));
+    let pub_key = delivered
+        .as_ref()
+        .map(|k| k.public_key.clone())
+        .unwrap_or_else(generate_sync_public_key);
+    let temp_key = delivered
+        .as_ref()
+        .map(|k| k.temp_key.clone())
+        .unwrap_or_default();
+
+    let before_total: usize = threads.iter().map(|t| t.messages.len()).sum();
+
+    // Resume from the checkpoint only if it belongs to the same transfer session.
+    let mut seq = {
+        let pub_key = pub_key.clone();
+        tokio::task::spawn_blocking(move || {
+            MessageStore::open(DB_PATH)
+                .ok()?
+                .resume_seq_if_same_session(&pub_key)
+                .ok()
+                .flatten()
+        })
+        .await?
+        .unwrap_or(0)
+    };
+
+    // Phase 1: wake the phone with the real keys. Failures are logged, not fatal — the
+    // phone may still push once the user confirms on screen.
+    on_progress(0.05, "📲 Đang gửi yêu cầu đồng bộ sâu tới điện thoại…".to_string());
+    if let Err(e) = chat::request_phone_sync_v2(s, &pub_key, &temp_key).await {
+        crate::logger::log_error("sync_deep_from_phone::wake_v2", &e.to_string());
+    }
+
+    // Phase 2: wait for the phone to confirm by probing page 0 (answer 114 = not yet).
+    let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut page = None;
+    while tokio::time::Instant::now() < wait_deadline {
+        if DEEP_SYNC_CANCEL.load(Ordering::Relaxed) {
+            let _ = chat::cancel_phone_sync(s, &pub_key).await; // best-effort cleanup (INV-3)
+            return Ok((0, 0));
+        }
+        match chat::pull_mobile_page(s, &pub_key, 0, &temp_key).await {
+            Ok(resp) if !chat::mobile_page_rejected(&resp) => {
+                page = Some(resp);
+                break;
+            }
+            Ok(_) => { /* 114/-69: phone has not prepared the snapshot yet */ }
+            Err(e) => crate::logger::log_error("sync_deep_from_phone::probe", &e.to_string()),
+        }
+        on_progress(
+            0.10,
+            "⏳ Đang chờ điện thoại xác nhận đồng bộ (mở Zalo trên điện thoại nếu được hỏi)…"
+                .to_string(),
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    let Some(mut page) = page else {
+        anyhow::bail!("điện thoại không xác nhận đồng bộ trong thời gian chờ");
+    };
+
+    // Phase 3: page through the backup. `from_seq_id` advances by 1 per pull (official
+    // client: `t ? t+=1 : t=0`); exhaustion = a page that merges nothing new, or a
+    // rejected cursor (114/-69). Progress is heuristic — the total page count is unknown.
+    let mut added_total = 0usize;
+    let mut stale_pages = 0usize;
+    const MAX_PAGES: usize = 20_000;
+    const MAX_STALE: usize = 3;
+    for page_idx in 0..MAX_PAGES {
+        if DEEP_SYNC_CANCEL.load(Ordering::Relaxed) {
+            break;
+        }
+        let frac = 0.15 + 0.8 * (page_idx as f32 / 50.0).tanh().min(0.8);
+        on_progress(
+            frac.max(0.15),
+            format!("📥 Đang tải trang {seq} từ điện thoại… (+{added_total} tin)"),
+        );
+        let before = threads.iter().map(|t| t.messages.len()).sum::<usize>();
+        chat::merge_mobile_page(threads, &page);
+        let page_msgs = chat::count_mobile_page_msgs(&page);
+        let after = threads.iter().map(|t| t.messages.len()).sum::<usize>();
+        let added = after.saturating_sub(before);
+        added_total += added;
+
+        let snapshot = threads.clone();
+        let (pk, tk, s_seq) = (pub_key.clone(), temp_key.clone(), seq);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut st = MessageStore::open(DB_PATH)?;
+            store::persist_threads(&mut st, &snapshot)?;
+            st.set_deep_sync_checkpoint(s_seq + 1, &pk, &tk)?;
+            Ok(())
+        })
+        .await??;
+
+        if page_msgs == 0 {
+            break; // nothing at this seq: snapshot exhausted
+        }
+        stale_pages = if added == 0 { stale_pages + 1 } else { 0 };
+        if stale_pages >= MAX_STALE {
+            break;
+        }
+        seq += 1;
+        tokio::time::sleep(PAUSE).await;
+        match chat::pull_mobile_page(s, &pub_key, seq, &temp_key).await {
+            Ok(next) if !chat::mobile_page_rejected(&next) => page = next,
+            Ok(_) => break, // 114/-69: snapshot exhausted or session lost
+            Err(e) => {
+                crate::logger::log_error("sync_deep_from_phone::page", &e.to_string());
+                break;
+            }
+        }
+    }
+
+    // Phase 4: resolve names, dedup, persist the merged state (same tail as phone sync).
+    on_progress(0.97, "💾 Đang lưu lịch sử đã tải…".to_string());
+    chat::resolve_thread_names(s, threads).await;
+    chat::deduplicate_threads(threads, None);
+    let snapshot = threads.clone();
+    let db_added = tokio::task::spawn_blocking(move || -> Result<usize> {
+        let mut st = MessageStore::open(DB_PATH)?;
+        let n = store::persist_threads(&mut st, &snapshot)?;
+        chat::save_threads_cache(&snapshot);
+        Ok(n)
+    })
+    .await??;
+
+    let after_total: usize = threads.iter().map(|t| t.messages.len()).sum();
+    let added = db_added
+        .max(after_total.saturating_sub(before_total))
+        .max(added_total);
+    on_progress(
+        1.0,
+        format!("✅ Đồng bộ sâu hoàn tất: +{added} tin nhắn (đến trang {seq})"),
+    );
+    Ok((added, seq))
+}
+
+
 /// Fetch older pages for `t` until the server has nothing older, `MAX_PAGES` is hit, or the user
 /// cancels. Each page is committed immediately so a crash or cancel loses nothing. SQLite work
 /// runs on the blocking pool; no connection is held across an await.
@@ -131,7 +368,7 @@ where
         "📲 Đang gửi tín hiệu đồng bộ tới Zalo trên điện thoại…".to_string(),
     );
     let _ = chat::request_phone_sync(s, &pub_key).await;
-    let _ = chat::request_phone_sync_v2(s, &pub_key).await;
+    let _ = chat::request_phone_sync_v2(s, &pub_key, "").await;
 
     if PHONE_SYNC_CANCEL.load(Ordering::Relaxed) {
         let _ = chat::cancel_phone_sync(s, &pub_key).await;
