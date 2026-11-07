@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZaloData Exporter — Xuất lịch sử Zalo PC</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --border:#2a2f3a; --text:#e8eaf0; --muted:#9aa3b2; --accent:#4f8cff; --ok:#3ecf8e; --err:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13.5px; margin-bottom: 20px; }
+  .notice { background:#241f10; border:1px solid #5a4a1a; color:#e8d27c; padding:10px 14px; border-radius:8px; font-size:13px; margin-bottom:20px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; margin-bottom:16px; }
+  .card h2 { font-size:15px; margin:0 0 10px; color:var(--accent); }
+  .card h2 .step { display:inline-block; width:22px; height:22px; border-radius:50%; background:var(--accent); color:#fff; text-align:center; line-height:22px; margin-right:8px; font-size:12px; }
+  .muted { color:var(--muted); font-size:12.5px; }
+  code, pre { background:#0c0e12; border:1px solid var(--border); border-radius:6px; }
+  code { padding:1px 6px; font-size:12.5px; }
+  pre { padding:12px; overflow:auto; font-size:12px; line-height:1.5; }
+  input[type=text], input[type=file] { background:#0c0e12; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px 12px; font-size:14px; width:100%; }
+  input[type=text] { font-family: ui-monospace, monospace; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:14px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:transparent; border:1px solid var(--border); color:var(--text); font-weight:500; }
+  .drop { border:2px dashed var(--border); border-radius:10px; padding:26px; text-align:center; color:var(--muted); cursor:pointer; transition:.15s; }
+  .drop.hover { border-color:var(--accent); color:var(--accent); background:#12151c; }
+  .bar { height:8px; background:#0c0e12; border-radius:4px; overflow:hidden; margin:10px 0; }
+  .bar > div { height:100%; background:var(--accent); width:0%; transition:.2s; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:600; font-size:12px; }
+  tr.clickable { cursor:pointer; }
+  tr.clickable:hover { background:#12151c; }
+  .msgs { max-height:420px; overflow:auto; }
+  .msg { padding:8px 10px; border-bottom:1px solid var(--border); font-size:13.5px; }
+  .msg .meta { color:var(--muted); font-size:11.5px; margin-bottom:2px; }
+  .msg.out { background:#101828; }
+  .err { color:var(--err); font-size:13px; margin-top:8px; }
+  .ok { color:var(--ok); font-size:13px; margin-top:8px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .files { font-size:12.5px; color:var(--muted); max-height:80px; overflow:auto; }
+  a { color:var(--accent); }
+  .hide { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🔐 ZaloData Exporter</h1>
+  <div class="sub">Xuất lịch sử tin nhắn từ dữ liệu Zalo PC (<code>ZaloData</code>) thành SQLite / JSON — xử lý 100% trong trình duyệt, không gì được tải lên máy chủ.</div>
+  <div class="notice">⚠️ Công cụ chỉ dành cho <b>dữ liệu của chính bạn</b>, phục vụ sao lưu / di chuyển dữ liệu. Bạn cần mật khẩu SQLCipher của máy Zalo PC đó (xem bước 1).</div>
+
+  <div class="card">
+    <h2><span class="step">1</span>Lấy mật khẩu SQLCipher (passphrase)</h2>
+    <div class="muted">Mật khẩu được sinh theo từng lần cài Zalo PC và nằm trong bộ nhớ tiến trình Zalo khi đang mở.</div>
+    <ol class="muted" style="line-height:1.7">
+      <li>Mở ứng dụng <b>Zalo PC</b> và đăng nhập như bình thường.</li>
+      <li>Tải <a href="zalo_key_capture.py" download>zalo_key_capture.py</a> (chạy cục bộ, chỉ đọc bộ nhớ các tiến trình Zalo trên máy bạn).</li>
+      <li>Chạy: <code>python zalo_key_capture.py</code> — nó in ra dòng <code>PRAGMA key="…"</code>.</li>
+      <li>Copy phần trong ngoặc kép (32 ký tự) dán vào ô dưới.</li>
+    </ol>
+    <input type="text" id="pass" placeholder="dán passphrase 32 ký tự vào đây" spellcheck="false">
+  </div>
+
+  <div class="card">
+    <h2><span class="step">2</span>Chọn dữ liệu</h2>
+    <div id="drop" class="drop">Kéo–thả file <b>.db</b> của các hội thoại vào đây<br>
+      <span class="muted">(thư mục <code>ZaloData\Database\_production\&lt;uin&gt;\Core\Message\*.db</code>) — hoặc bấm để chọn nhiều file</span>
+    </div>
+    <input type="file" id="files" multiple accept=".db" class="hide">
+    <div id="fileList" class="files" style="margin-top:8px"></div>
+    <div style="margin-top:10px">
+      <div class="muted" style="margin-bottom:4px">UIN của bạn (tên thư mục trong <code>Database\_production\&lt;uin&gt;</code>):</div>
+      <input type="text" id="uin" placeholder="ví dụ 1841717168353723582" spellcheck="false">
+    </div>
+    <div class="muted" style="margin-top:8px">Tuỳ chọn — thêm nguồn tên hiển thị:
+      <label class="muted" style="margin-left:8px"><input type="checkbox" id="wantStorage"> Storage.db (tên bạn bè, nằm ở <code>Database\_production\Storage.db</code>)</label>
+      <label class="muted" style="margin-left:8px"><input type="checkbox" id="wantCache"> threads_cache.json (tên nhóm từ ctdozlite)</label>
+    </div>
+    <div id="extraSlots" class="hide" style="margin-top:8px">
+      <input type="file" id="storageFile" accept=".db"><span class="muted"> Storage.db</span><br>
+      <input type="file" id="cacheFile" accept=".json" style="margin-top:6px"><span class="muted"> threads_cache.json</span>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button id="go" disabled>Giải mã &amp; đọc tin nhắn</button>
+      <span id="status" class="muted"></span>
+    </div>
+    <div class="bar"><div id="bar"></div></div>
+    <div id="msg" class="err"></div>
+  </div>
+
+  <div class="card hide" id="resultCard">
+    <h2><span class="step">3</span>Kết quả</h2>
+    <div id="summary" class="muted" style="margin-bottom:10px"></div>
+    <div class="row" style="margin-bottom:12px">
+      <button id="expSqlite">⬇️ Tải SQLite</button>
+      <button id="expJson" class="ghost">⬇️ Tải JSON</button>
+    </div>
+    <table id="threadTable">
+      <thead><tr><th>Hội thoại</th><th>Loại</th><th>Số tin</th><th>Gần nhất</th></tr></thead>
+      <tbody id="threadRows"></tbody>
+    </table>
+    <div id="msgView" class="hide">
+      <div class="row" style="margin:12px 0 6px">
+        <b id="viewTitle"></b>
+        <button class="ghost" id="back" style="margin-left:auto">← Danh sách</button>
+      </div>
+      <input type="text" id="search" placeholder="tìm trong hội thoại này…" style="margin-bottom:8px">
+      <div id="msgs" class="msgs"></div>
+    </div>
+  </div>
+</div>
+<script src="vendor/aes-js.min.js"></script>
+<script src="vendor/sql-wasm.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

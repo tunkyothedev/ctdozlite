@@ -198,26 +198,33 @@ def write_sqlite(out_path: Path, uin: str, threads: dict[str, list[dict]], names
 
 
 def write_json(out_path: Path, uin: str, threads: dict[str, list[dict]], names):
-    payload = {
-        "exported_at": datetime.now().isoformat(),
-        "uin": uin,
-        "source": "ZaloData Core/Message per-thread DBs (SQLCipher)",
-        "threads": [
-            {
-                "id": thread_id,
-                "name": names.get(thread_id, ("", 0))[0],
-                "is_group": names.get(thread_id, ("", 0))[1],
-                "message_count": len(msgs),
-                "messages": [
-                    {**m, "raw": m["raw"] if isinstance(m["raw"], (str, int, float)) else m["raw"]}
-                    for m in msgs
-                ],
-            }
-            for thread_id, msgs in sorted(threads.items(), key=lambda kv: -(kv[1][-1]["ts"] if kv[1] else 0))
-        ],
-    }
+    """Emit a ctdozlite-native JSON export: a bare array of `Thread` objects whose
+    `messages` match the `ChatMessage` serde shape — importable directly via
+    Cài đặt → Nhập lịch sử on v0.0.8+ (see store.rs import_history_from_path)."""
+    payload = []
+    for thread_id, msgs in sorted(threads.items(), key=lambda kv: -(kv[1][-1]["ts"] if kv[1] else 0)):
+        name, is_group = names.get(thread_id, ("", 0))
+        payload.append({
+            "id": thread_id,
+            "name": name or f"Người dùng {thread_id}",
+            "preview": "",
+            "time": "",
+            "avatar": None,
+            "is_group": bool(is_group),
+            "messages": [
+                {
+                    "id": m["msg_id"],
+                    "sender": m["sender_id"],
+                    "text": m["text"],
+                    "time": datetime.fromtimestamp(m["ts"] / 1000).strftime("%H:%M") if m["ts"] else "",
+                    "is_outgoing": bool(m["is_outgoing"]),
+                    "ts": m["ts"] // 1000,
+                }
+                for m in msgs
+            ],
+        })
     out_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    return sum(len(m["messages"]) for m in payload["threads"])
+    return sum(len(t["messages"]) for t in payload)
 
 
 def main() -> int:
