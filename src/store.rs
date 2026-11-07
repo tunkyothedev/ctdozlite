@@ -1192,9 +1192,13 @@ pub fn recover_zalo_localstorage_key(base_dir: &std::path::Path) -> String {
         ]
     };
 
-    for d in 1..=6usize {
-        let mut key = vec![None; 32];
-        for chars in &occurrences {
+    // Each `z_ecrp_` occurrence is an independently encrypted value; only records shaped
+    // like the version/list_recent JSON can yield a key, so evaluate them one by one and
+    // return the first candidate whose 32 slots are all hex digits. Merging occurrences
+    // would let unrelated records corrupt the slot map.
+    for chars in &occurrences {
+        for d in 1..=6usize {
+            let mut key = vec![None; 32];
             for (plain_off, plain) in windows(d) {
                 for (j, pc) in plain.iter().enumerate() {
                     let slot = (plain_off + j) % 32;
@@ -1203,12 +1207,12 @@ pub fn recover_zalo_localstorage_key(base_dir: &std::path::Path) -> String {
                     }
                 }
             }
-        }
-        if key
-            .iter()
-            .all(|k| matches!(k, Some(c) if c.is_ascii_hexdigit()))
-        {
-            return key.into_iter().map(|k| k.unwrap()).collect();
+            if key
+                .iter()
+                .all(|k| matches!(k, Some(c) if c.is_ascii_hexdigit()))
+            {
+                return key.into_iter().map(|k| k.unwrap()).collect();
+            }
         }
     }
     FALLBACK.into()
@@ -1831,10 +1835,6 @@ mod tests {
     #[test]
     fn recover_zalo_localstorage_key_reads_z_ecrp_record_with_any_version_length() {
         let real_key = "0123456789abcdef0123456789abcdef";
-        let marker: Vec<u8> = "z_ecrp_"
-            .encode_utf16()
-            .flat_map(|u| u.to_le_bytes())
-            .collect();
         let dir = std::env::temp_dir().join(format!("zalo_lskey_{}", std::process::id()));
         std::fs::create_dir_all(
             dir.join("Partitions")
@@ -1848,27 +1848,10 @@ mod tests {
             let plain = format!(
                 "{{\"version\":{version_digits},\"list_recent\":[{{\"displayName\":\"Nguyễn Văn Ận\",\"avatar\":\"x\"}}]}}"
             );
-            let xored: String = plain
-                .chars()
-                .enumerate()
-                .map(|(i, c)| {
-                    char::from_u32(c as u32 ^ real_key.as_bytes()[i % 32] as u32).unwrap()
-                })
-                .collect();
-            let mut blob: Vec<u8> = marker.clone();
-            for unit in xored.encode_utf16() {
-                blob.extend_from_slice(&unit.to_le_bytes());
-            }
-            std::fs::write(
-                dir.join("Partitions")
-                    .join("zalo")
-                    .join("Local Storage")
-                    .join("leveldb")
-                    .join(fname),
-                &blob,
-            )
-            .unwrap();
+            write_xored_record(&dir, fname, &plain, real_key);
         }
+        // A decoy record with the same key but a different shape must not corrupt recovery.
+        write_xored_record(&dir, "decoy.ldb", "{\"foo\":\"bar\"}", real_key);
 
         let recovered = super::recover_zalo_localstorage_key(&dir);
         std::fs::remove_dir_all(&dir).ok();
@@ -1876,6 +1859,34 @@ mod tests {
             recovered, real_key,
             "(INV-1) XOR key must survive any version digit count"
         );
+    }
+
+    #[cfg(test)]
+    fn write_xored_record(dir: &std::path::Path, fname: &str, plain: &str, key: &str) {
+        let marker: Vec<u8> = "z_ecrp_"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let xored: String = plain
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                char::from_u32(c as u32 ^ key.as_bytes()[i % key.len()] as u32).unwrap()
+            })
+            .collect();
+        let mut blob: Vec<u8> = marker;
+        for unit in xored.encode_utf16() {
+            blob.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(
+            dir.join("Partitions")
+                .join("zalo")
+                .join("Local Storage")
+                .join("leveldb")
+                .join(fname),
+            &blob,
+        )
+        .unwrap();
     }
 
     #[test]
