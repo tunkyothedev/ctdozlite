@@ -202,6 +202,18 @@ pub enum GuiEvent {
         cancelled: bool,
         error: Option<String>,
     },
+    /// The phone delivered a `transfer_after_login` event — deep sync is now possible.
+    TransferReady,
+    DeepSyncProgress {
+        progress: f32,
+        status: String,
+    },
+    DeepSyncFinished {
+        threads: Vec<Thread>,
+        added: usize,
+        cancelled: bool,
+        error: Option<String>,
+    },
     ProxyUpdated(Result<Option<String>, String>),
     FileDownloaded(Result<(String, String), String>),
     LoggedOut,
@@ -581,6 +593,10 @@ pub struct ZaloGuiApp {
     scheduled_items: Vec<crate::scheduler::ScheduledMessage>,
     phone_sync_progress: f32,
     phone_sync_status: String,
+    deep_sync_progress: f32,
+    deep_sync_status: String,
+    /// True between pressing "Đồng bộ sâu" and the phone's `transfer_after_login` event.
+    deep_sync_awaiting_phone: bool,
 
     // Background channels
     event_rx: Receiver<GuiEvent>,
@@ -814,6 +830,9 @@ impl ZaloGuiApp {
                 .unwrap_or_default(),
             phone_sync_progress: 0.0,
             phone_sync_status: String::new(),
+            deep_sync_progress: 0.0,
+            deep_sync_status: String::new(),
+            deep_sync_awaiting_phone: false,
             event_rx: rx,
             event_tx: tx.clone(),
             chat_render_window: (String::new(), CHAT_RENDER_STEP),
@@ -1708,6 +1727,50 @@ impl ZaloGuiApp {
                         "ℹ️ Không có tin nhắn mới được đẩy từ điện thoại (hãy mở Zalo trên điện thoại và xác nhận đồng bộ nếu có yêu cầu)".into()
                     };
                     self.phone_sync_status = msg.clone();
+                    self.status_msg = msg.clone();
+                    self.show_toast(msg);
+                }
+                GuiEvent::TransferReady => {
+                    // The phone published a backup session; tell the user the deep-sync
+                    // button is armed. The run itself stays manual (no surprise downloads).
+                    self.deep_sync_awaiting_phone = false;
+                    let msg = "📲 Điện thoại đã sẵn sàng chia sẻ lịch sử — bấm \"Đồng bộ sâu\" để tải";
+                    self.show_toast(msg.to_string());
+                }
+                GuiEvent::DeepSyncProgress { progress, status } => {
+                    self.deep_sync_progress = progress;
+                    self.deep_sync_status = status.clone();
+                    self.status_msg = status;
+                }
+                GuiEvent::DeepSyncFinished {
+                    threads,
+                    added,
+                    cancelled,
+                    error,
+                } => {
+                    self.deep_sync_progress = 0.0;
+                    self.deep_sync_awaiting_phone = false;
+                    if !threads.is_empty() {
+                        for nt in threads {
+                            if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
+                            {
+                                crate::chat::merge_thread_into(existing, nt, true);
+                            } else if !nt.id.is_empty() && nt.id != "0" {
+                                self.threads.push(nt);
+                            }
+                        }
+                        self.persist_threads_async();
+                    }
+                    let msg = if let Some(err) = error {
+                        format!("⚠️ Đồng bộ sâu thất bại: {err}")
+                    } else if cancelled {
+                        format!("Đã dừng đồng bộ sâu (đã nhận {added} tin nhắn)")
+                    } else if added > 0 {
+                        format!("✅ Đồng bộ sâu hoàn tất: nhận {added} tin nhắn lịch sử")
+                    } else {
+                        "ℹ️ Không có lịch sử mới từ điện thoại (mở Zalo trên điện thoại và xác nhận đồng bộ nếu được hỏi)".into()
+                    };
+                    self.deep_sync_status = msg.clone();
                     self.status_msg = msg.clone();
                     self.show_toast(msg);
                 }

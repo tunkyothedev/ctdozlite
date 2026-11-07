@@ -190,6 +190,9 @@ pub enum WorkerCmd {
     SyncPhoneMessages {
         threads: Vec<Thread>,
     },
+    SyncDeepMessages {
+        threads: Vec<Thread>,
+    },
     SetProxy {
         proxy_url: String,
     },
@@ -511,6 +514,22 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 let _ = gui_tx_ws
                                                     .send(GuiEvent::MuteEventsReceived(mute_evs));
                                                 ctx_ws.request_repaint();
+                                            }
+                                            // Deep-sync transfer keys arrive as a control
+                                            // event, not a chat frame (re-notes/09 §2).
+                                            if let Some(keys) =
+                                                crate::history_sync::extract_transfer_act(
+                                                    data_node,
+                                                    &s_snap.imei,
+                                                )
+                                            {
+                                                if let Ok(mut guard) =
+                                                    crate::history_sync::TRANSFER_KEYS.lock()
+                                                {
+                                                    *guard = Some(keys);
+                                                    let _ = gui_tx_ws.send(GuiEvent::TransferReady);
+                                                    ctx_ws.request_repaint();
+                                                }
                                             }
                                             if ev.is_chat_ish() {
                                                 let mut ws_threads = Vec::new();
@@ -2913,6 +2932,68 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 }
                                 ctx_clone.request_repaint();
                                 crate::history_sync::PHONE_SYNC_RUNNING
+                                    .store(false, Ordering::SeqCst);
+                            });
+                        }
+                        WorkerCmd::SyncDeepMessages { mut threads } => {
+                            use std::sync::atomic::Ordering;
+                            if crate::history_sync::DEEP_SYNC_RUNNING.swap(true, Ordering::SeqCst) {
+                                continue;
+                            }
+                            crate::history_sync::DEEP_SYNC_CANCEL.store(false, Ordering::Relaxed);
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                // Clone (not take) the keys: a failed run must leave them in
+                                // place so the user can simply retry; they are cleared on success.
+                                let keys = crate::history_sync::TRANSFER_KEYS
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| g.clone());
+                                let gui_tx_prog = gui_tx_clone.clone();
+                                let ctx_prog = ctx_clone.clone();
+                                let res = crate::history_sync::sync_deep_from_phone(
+                                    &s,
+                                    &mut threads,
+                                    keys,
+                                    move |progress, status| {
+                                        let _ = gui_tx_prog
+                                            .send(GuiEvent::DeepSyncProgress { progress, status });
+                                        ctx_prog.request_repaint();
+                                    },
+                                )
+                                .await;
+                                let cancelled = crate::history_sync::DEEP_SYNC_CANCEL
+                                    .load(Ordering::Relaxed);
+                                match res {
+                                    Ok((added, _last_seq)) => {
+                                        // Snapshot fully drained: drop the keys so the next
+                                        // run waits for a fresh `transfer_after_login`.
+                                        if let Ok(mut guard) =
+                                            crate::history_sync::TRANSFER_KEYS.lock()
+                                        {
+                                            *guard = None;
+                                        }
+                                        let _ = gui_tx_clone.send(GuiEvent::DeepSyncFinished {
+                                            threads,
+                                            added,
+                                            cancelled,
+                                            error: None,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::DeepSyncFinished {
+                                            threads,
+                                            added: 0,
+                                            cancelled,
+                                            error: Some(e.to_string()),
+                                        });
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                                crate::history_sync::DEEP_SYNC_RUNNING
                                     .store(false, Ordering::SeqCst);
                             });
                         }

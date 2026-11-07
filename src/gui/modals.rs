@@ -758,6 +758,7 @@ impl ZaloGuiApp {
         let mut theme_switched = false;
         let mut trigger_sync = false;
         let mut trigger_phone_sync = false;
+        let mut trigger_deep_sync = false;
         let mut apply_proxy_now = false;
         let mut clear_proxy_now = false;
         let mut spawn_multi_zalo = false;
@@ -1332,6 +1333,93 @@ impl ZaloGuiApp {
                                                                 ui.add_space(6.0);
                                                                 ui.label(
                                                                     RichText::new(&self.phone_sync_status)
+                                                                        .color(pal.text_secondary)
+                                                                        .size(12.0),
+                                                                );
+                                                            }
+                                                        }
+                                                    });
+                                                });
+                                            ui.add_space(16.0);
+                                            ui.label(RichText::new("🔄 Đồng bộ sâu từ điện thoại (toàn bộ lịch sử 1-1 & nhóm)").color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(10.0))
+                                                .inner_margin(Margin::same(14.0))
+                                                .show(ui, |ui| {
+                                                    ui.vertical(|ui| {
+                                                        ui.label(
+                                                            RichText::new(
+                                                                "Kéo toàn bộ lịch sử tin nhắn mà điện thoại đang giữ (1-1 & nhóm), giống cách Zalo PC chính thức đổ lịch sử khi đăng nhập máy mới. Điện thoại cần xác nhận một lần.",
+                                                            )
+                                                            .size(13.0)
+                                                            .color(pal.text_primary),
+                                                        );
+                                                        ui.add_space(4.0);
+                                                        ui.label(
+                                                            RichText::new(
+                                                                "Mẹo: giữ Zalo trên điện thoại mở; khi điện thoại hỏi xác nhận đồng bộ hãy CHẤP NHẬN. Nếu dừng giữa chừng, lần chạy sau tiếp tục từ mốc đã tải.",
+                                                            )
+                                                            .size(12.2)
+                                                            .color(pal.text_secondary),
+                                                        );
+                                                        ui.add_space(10.0);
+                                                        if crate::history_sync::DEEP_SYNC_RUNNING
+                                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                                        {
+                                                            ui.add(
+                                                                egui::ProgressBar::new(
+                                                                    self.deep_sync_progress.clamp(0.05, 1.0),
+                                                                )
+                                                                .text(&self.deep_sync_status)
+                                                                .animate(true),
+                                                            );
+                                                            ui.add_space(6.0);
+                                                            if ui
+                                                                .button(RichText::new("Dừng đồng bộ sâu").size(13.0))
+                                                                .clicked()
+                                                            {
+                                                                crate::history_sync::DEEP_SYNC_CANCEL.store(
+                                                                    true,
+                                                                    std::sync::atomic::Ordering::Relaxed,
+                                                                );
+                                                            }
+                                                        } else {
+                                                            if self.deep_sync_awaiting_phone {
+                                                                ui.label(
+                                                                    RichText::new(
+                                                                        "⏳ Đang chờ điện thoại mở phiên chia sẻ (mở Zalo trên điện thoại, xác nhận nếu được hỏi)…",
+                                                                    )
+                                                                    .size(12.5)
+                                                                    .color(pal.text_secondary),
+                                                                );
+                                                                ui.add_space(6.0);
+                                                            }
+                                                            let armed = crate::history_sync::TRANSFER_KEYS
+                                                                .lock()
+                                                                .map(|g| g.is_some())
+                                                                .unwrap_or(false);
+                                                            let label = if armed {
+                                                                "Bắt đầu đồng bộ sâu ngay"
+                                                            } else {
+                                                                "Đồng bộ sâu ngay (sẽ chờ điện thoại xác nhận)"
+                                                            };
+                                                            if ui
+                                                                .button(
+                                                                    RichText::new(format!("{} {label}", lucide::REFRESH))
+                                                                        .size(13.0)
+                                                                        .strong(),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                trigger_deep_sync = true;
+                                                            }
+                                                            if !self.deep_sync_status.is_empty() {
+                                                                ui.add_space(6.0);
+                                                                ui.label(
+                                                                    RichText::new(&self.deep_sync_status)
                                                                         .color(pal.text_secondary)
                                                                         .size(12.0),
                                                                 );
@@ -2459,6 +2547,16 @@ impl ZaloGuiApp {
                 let _ = tx.send(WorkerCmd::SyncPhoneMessages { threads });
             }
             self.show_toast("📲 Đang yêu cầu đồng bộ tin nhắn từ điện thoại…");
+        }
+        if trigger_deep_sync {
+            self.deep_sync_progress = 0.05;
+            self.deep_sync_status = "📲 Đang chờ điện thoại xác nhận đồng bộ sâu…".into();
+            self.deep_sync_awaiting_phone = true;
+            let threads = self.threads.clone();
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::SyncDeepMessages { threads });
+            }
+            self.show_toast("🔄 Đang yêu cầu đồng bộ sâu từ điện thoại…");
         }
         if apply_proxy_now {
             let proxy_url = self.settings.proxy_url.trim().to_string();
